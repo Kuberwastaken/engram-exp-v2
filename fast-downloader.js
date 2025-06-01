@@ -15,7 +15,7 @@ class MegaScraper {
         this.syllabusxBaseUrl = 'https://server.syllabusx.live';
         
         // Shared configuration - SINGLE TARGET DIRECTORY
-        this.materialsDir = path.resolve('../material');
+        this.materialsDir = path.resolve('./material');
         
         // DotNotes branch IDs (MASTER BRANCH STRUCTURE)
         this.dotNotesBranches = {
