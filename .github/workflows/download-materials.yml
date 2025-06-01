@@ -1,0 +1,209 @@
+name: Download Materials
+
+on:
+  workflow_dispatch: 
+    inputs:
+      force_continue:
+        description: 'Force continue from previous run'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: '0 2 * * 0'
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 320  # 5 hours and 20 minutes total (includes 20 min buffer for commit/push)
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 1
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm install
+
+    - name: Create material directory
+      run: mkdir -p material
+
+    - name: Debug - Check files before download
+      run: |
+        echo "Current directory contents:"
+        ls -la
+        echo "Package.json exists: $([ -f package.json ] && echo 'YES' || echo 'NO')"
+        echo "Fast-downloader.js exists: $([ -f fast-downloader.js ] && echo 'YES' || echo 'NO')"
+        echo "Material directory exists: $([ -d material ] && echo 'YES' || echo 'NO')"
+
+    - name: Run fast downloader with 5-hour timeout
+      id: download_step
+      run: |
+        echo "Starting download process with 5-hour automatic commit..."
+        echo "Node version: $(node --version)"
+        echo "NPM version: $(npm --version)"
+        echo "Start time: $(date -u)"
+        
+        # Start the download process with timeout
+        # Use timeout command to limit execution to 5 hours (300 minutes)
+        if timeout 300m node fast-downloader.js; then
+          echo "download_success=true" >> $GITHUB_OUTPUT
+          echo "download_completed=true" >> $GITHUB_OUTPUT
+          echo "✅ Download completed successfully within time limit"
+        else
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -eq 124 ]; then
+            echo "download_success=partial" >> $GITHUB_OUTPUT
+            echo "download_completed=false" >> $GITHUB_OUTPUT
+            echo "⏰ Download timed out after 5 hours - will commit progress and continue in next run"
+          else
+            echo "download_success=error" >> $GITHUB_OUTPUT
+            echo "download_completed=false" >> $GITHUB_OUTPUT
+            echo "❌ Download failed with exit code: $EXIT_CODE"
+          fi
+        fi
+        
+        echo "End time: $(date -u)"
+      env:
+        NODE_ENV: production
+
+    - name: Debug - Check files after download
+      if: always()
+      run: |
+        echo "Material directory contents after download:"
+        if [ -d "material" ]; then
+          echo "Material directory exists with $(find material -type f | wc -l) files"
+          ls -la material/ || echo "Cannot list material directory"
+          echo "First 10 files found:"
+          find material -type f | head -10 || echo "No files found"
+          echo "Total size: $(du -sh material 2>/dev/null | cut -f1 || echo 'Unknown')"
+        else
+          echo "❌ Material directory does not exist"
+        fi
+
+    - name: Check if files were downloaded
+      id: check_changes
+      if: always()
+      run: |
+        echo "Checking git status..."
+        git status --porcelain
+        
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "changes=true" >> $GITHUB_OUTPUT
+          echo "✅ Files were downloaded or modified"
+        else
+          echo "changes=false" >> $GITHUB_OUTPUT
+          echo "⚠️ No new files downloaded"
+        fi
+
+    - name: Configure Git
+      if: steps.check_changes.outputs.changes == 'true'
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+
+    - name: Add downloaded files
+      if: steps.check_changes.outputs.changes == 'true'
+      run: |
+        echo "Adding files to git..."
+        git add material/
+        git add -A
+        echo "Files added successfully"
+
+    - name: Commit files
+      if: steps.check_changes.outputs.changes == 'true'
+      run: |
+        echo "Creating commit..."
+        
+        DOWNLOADED_COUNT=$(find material -type f -name "*.pdf" -o -name "*.json" | wc -l || echo "0")
+        TOTAL_COUNT=$(find material -type f | wc -l || echo "0")
+        TOTAL_SIZE=$(du -sh material 2>/dev/null | cut -f1 || echo "0B")
+        TIMESTAMP=$(date -u +'%Y-%m-%d %H:%M:%S UTC')
+        
+        # Different commit messages based on completion status
+        if [ "${{ steps.download_step.outputs.download_completed }}" = "true" ]; then
+          COMMIT_MSG="📚 ✅ COMPLETE: Auto-download materials - Total: $TOTAL_COUNT files ($TOTAL_SIZE) - PDF/JSON: $DOWNLOADED_COUNT - $TIMESTAMP - Run #${{ github.run_number }}"
+        elif [ "${{ steps.download_step.outputs.download_success }}" = "partial" ]; then
+          COMMIT_MSG="📚 ⏰ PARTIAL: Auto-download materials (5h timeout) - Total: $TOTAL_COUNT files ($TOTAL_SIZE) - PDF/JSON: $DOWNLOADED_COUNT - $TIMESTAMP - Run #${{ github.run_number }}"
+        else
+          COMMIT_MSG="📚 🔄 PROGRESS: Auto-download materials - Total: $TOTAL_COUNT files ($TOTAL_SIZE) - PDF/JSON: $DOWNLOADED_COUNT - $TIMESTAMP - Run #${{ github.run_number }}"
+        fi
+        
+        git commit -m "$COMMIT_MSG" || echo "No changes to commit"
+
+    - name: Push changes
+      if: steps.check_changes.outputs.changes == 'true'
+      uses: ad-m/github-push-action@master
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        branch: ${{ github.ref }}
+
+    - name: Trigger continuation workflow if needed
+      if: steps.download_step.outputs.download_completed == 'false' && steps.check_changes.outputs.changes == 'true'
+      run: |
+        echo "Download was not completed - triggering continuation..."
+        curl -X POST \
+          -H "Accept: application/vnd.github.v3+json" \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          -H "Content-Type: application/json" \
+          https://api.github.com/repos/${{ github.repository }}/actions/workflows/download-materials.yml/dispatches \
+          -d '{"ref":"${{ github.ref_name }}","inputs":{"force_continue":"true"}}'
+        echo "✅ Continuation workflow triggered"
+
+    - name: Upload materials as artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: downloaded-materials-${{ github.run_number }}
+        path: material/
+        retention-days: 30
+        if-no-files-found: ignore
+
+    - name: Print summary
+      if: always()
+      run: |
+        echo "## Download Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- **Action Run**: #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Timestamp**: $(date -u)" >> $GITHUB_STEP_SUMMARY
+        echo "- **Download Status**: ${{ steps.download_step.outputs.download_success || 'unknown' }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Completed**: ${{ steps.download_step.outputs.download_completed || 'unknown' }}" >> $GITHUB_STEP_SUMMARY
+        
+        if [ -d "material" ]; then
+          FILE_COUNT=$(find material -type f | wc -l || echo "0")
+          PDF_JSON_COUNT=$(find material -type f -name "*.pdf" -o -name "*.json" | wc -l || echo "0")
+          TOTAL_SIZE=$(du -sh material 2>/dev/null | cut -f1 || echo "0B")
+          echo "- **Total Files**: $FILE_COUNT" >> $GITHUB_STEP_SUMMARY
+          echo "- **PDF/JSON Files**: $PDF_JSON_COUNT" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total Size**: $TOTAL_SIZE" >> $GITHUB_STEP_SUMMARY
+          echo "- **Changes Detected**: ${{ steps.check_changes.outputs.changes || 'unknown' }}" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "- **Status**: ❌ No material directory found" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ steps.download_step.outputs.download_completed }}" = "true" ] && [ "${{ steps.check_changes.outputs.changes }}" = "true" ]; then
+          echo "✅ **COMPLETE**: Download finished successfully and all files were committed!" >> $GITHUB_STEP_SUMMARY
+        elif [ "${{ steps.download_step.outputs.download_success }}" = "partial" ] && [ "${{ steps.check_changes.outputs.changes }}" = "true" ]; then
+          echo "⏰ **CONTINUING**: Download timed out after 5 hours. Progress saved and continuation workflow triggered!" >> $GITHUB_STEP_SUMMARY
+          echo "📋 The script will resume from where it left off in the next run due to built-in resume functionality." >> $GITHUB_STEP_SUMMARY
+        elif [ "${{ steps.download_step.outputs.download_success }}" = "true" ] && [ "${{ steps.check_changes.outputs.changes }}" = "false" ]; then
+          echo "ℹ️ **UP-TO-DATE**: Download completed but no new files (all files already exist)" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ **ERROR**: Download encountered errors - check the logs above for details" >> $GITHUB_STEP_SUMMARY
+          echo "💡 **RETRY**: The workflow can be run again manually (resume functionality will continue from where it left off)" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Resume Mechanism" >> $GITHUB_STEP_SUMMARY
+        echo "🔄 The fast-downloader script has built-in resume functionality:" >> $GITHUB_STEP_SUMMARY
+        echo "- Automatically skips files that already exist (size > 100 bytes)" >> $GITHUB_STEP_SUMMARY
+        echo "- Continues from where the previous run left off" >> $GITHUB_STEP_SUMMARY
+        echo "- Safe to run multiple times without duplicate downloads" >> $GITHUB_STEP_SUMMARY
